@@ -187,6 +187,81 @@ static int set_nonblock(int sfd) {
     return 0;
 }
 
+int listener_accept(int sfd, int efd) {
+    int status;
+    struct epoll_event event;
+
+    while (1) {
+        int infd;
+        struct sockaddr in_addr;
+        char host[NI_MAXHOST], serv[NI_MAXSERV];
+        socklen_t in_addrlen = sizeof in_addr;
+
+        infd = accept(sfd, &in_addr, &in_addrlen);
+        if (infd == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            perror("accept");
+            break;
+        }
+
+        status = getnameinfo(&in_addr, in_addrlen, host, sizeof host,
+                             serv, sizeof serv,
+                             NI_NUMERICHOST | NI_NUMERICSERV);
+        if (status == 0)
+            printf("accepted %s:%s on %d fd\n", host, serv, infd);
+        
+        status = set_nonblock(infd);
+        if (status == -1)
+            return -1;
+
+        event.data.fd = infd;
+        event.events = EPOLLIN | EPOLLET;
+
+        status = epoll_ctl(efd, EPOLL_CTL_ADD, infd, &event);
+        if (status == -1) {
+            perror("epoll_ctl");
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+int client_read(struct epoll_event *event) {
+    int status;
+    int done = 0; 
+
+    for (;;) {
+        ssize_t count;
+        char buf[512];
+
+        count = read(event->data.fd, buf, sizeof buf);
+        if (count == -1) {
+            if (errno != EAGAIN) {
+                perror("read");
+                done = 1;
+            }
+            break;
+        } else if (count == 0) {
+            done = 1;
+            break;
+        }
+
+        status = write(1, buf, count);
+        if (status == -1) {
+            perror("write");
+            return -1;
+        }
+    }
+
+    if (done) {
+        printf("closed %d fd\n", event->data.fd);
+        close(event->data.fd);
+    }
+
+    return 0;
+}
+
 const char* const USAGE = "usage: %s <port> <file>\n";
 
 int main(int argc, char *argv[]) {
@@ -258,68 +333,11 @@ int main(int argc, char *argv[]) {
                 close(events[i].data.fd);
                 continue;
             } else if (events[i].data.fd == sfd) {
-                while (1) {
-                    int infd;
-                    struct sockaddr in_addr;
-                    char host[NI_MAXHOST], serv[NI_MAXSERV];
-                    socklen_t in_addrlen = sizeof in_addr;
-
-                    infd = accept(sfd, &in_addr, &in_addrlen);
-                    if (infd == -1) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        perror("accept");
-                        break;
-                    }
-
-                    status = getnameinfo(&in_addr, in_addrlen, host, sizeof host,
-                                         serv, sizeof serv,
-                                         NI_NUMERICHOST | NI_NUMERICSERV);
-                    if (status == 0)
-                        printf("accepted %s:%s on %d fd\n", host, serv, infd);
-                    
-                    status = set_nonblock(infd);
-                    if (status == -1)
-                        exit(EXIT_FAILURE);
-
-                    event.data.fd = infd;
-                    event.events = EPOLLIN | EPOLLET;
-
-                    status = epoll_ctl(efd, EPOLL_CTL_ADD, infd, &event);
-                    if (status == -1) {
-                        perror("epoll_ctl");
-                        exit(EXIT_FAILURE);
-                    }
-                }
+                status = listener_accept(sfd, efd);
+                if (status == -1) exit(EXIT_FAILURE);
             } else {
-                int done = 0; 
-
-                for (;;) {
-                    ssize_t count;
-                    char buf[512];
-
-                    count = read(events[i].data.fd, buf, sizeof buf);
-                    if (count == -1) {
-                        if (errno != EAGAIN) {
-                            perror("read");
-                            done = 1;
-                        }
-                        break;
-                    } else if (count == 0) {
-                        done = 1;
-                        break;
-                    }
-
-                    status = write(1, buf, count);
-                    if (status == -1) {
-                        perror("write");
-                        exit(EXIT_FAILURE);
-                    }
-                }
-
-                if (done) {
-                    printf("closed %d fd\n", events[i].data.fd);
-                    close(events[i].data.fd);
-                }
+                status = client_read(&events[i]);
+                if (status == -1) exit(EXIT_FAILURE);
             }
         }
     }
