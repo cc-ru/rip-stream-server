@@ -2,7 +2,7 @@ CC = gcc
 
 DEBUG ?= 1
 ifeq ($(DEBUG), 1)
-	CFLAGS = -g -O1 -Wall -Wextra -pedantic -std=c99
+	CFLAGS = -D DEBUG -g -O1 -Wall -Wextra -pedantic -std=c99
 	TARGET = target/debug
 else
 	CFLAGS = -O2 -Wall -Wextra -pedantic -std=c99
