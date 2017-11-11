@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/epoll.h>
@@ -10,6 +11,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <byteswap.h>
 
 #define MAXEVENTS 64
 
@@ -27,7 +29,97 @@
 #define DEBUG_PRINT(...) do {} while (0)
 #endif
 
-const char* const USAGE = "usage: %s <port>\n";
+struct track_metadata {
+    char *name;
+    char *artist;
+    char *album;
+    uint32_t length;
+};
+
+static void print_metadata(struct track_metadata *metadata) {
+    printf("%s (%s) - %s [%u B]", metadata->artist, metadata->album, metadata->name, metadata->length);
+}
+
+static int read_string(FILE *f, char **out) {
+    int count;
+    uint16_t len;
+
+    count = fread(&len, 1, 2, f);
+    if (count == 0) {
+        fprintf(stderr, "parse_rip: unexpected EOF\n");
+        return -1;
+    } else if (count != 2) {
+        perror("parse_rip");
+        return -1;
+    }
+
+#ifdef __LITTLE_ENDIAN
+    len = __bswap_16(len); 
+#endif
+
+    *out = (char *) malloc(len);
+
+    count = fread(*out, 1, len, f);
+    if (count == 0) {
+        fprintf(stderr, "parse_rip: unexpected EOF\n");
+        return -1;
+    } else if (count != len) {
+        perror("parse_rip");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int parse_rip(FILE *f, struct track_metadata *metadata) {
+    int status, count;
+    char signature[4];
+    signature[3] = 0;
+
+    count = fread(signature, 1, 3, f);
+    if (count == 0) {
+        fprintf(stderr, "parse_rip: unexpected EOF\n");
+        return -1;
+    } else if (count != 3) {
+        perror("parse_rip");
+        return -1;
+    }
+
+    if (strcmp(signature, "rip") != 0) {
+        fprintf(stderr, "parse_rip: bad signature\n");
+        return -1;
+    }
+
+    status = read_string(f, &metadata->name);
+    if (status == -1) return -1;
+
+    status = read_string(f, &metadata->artist);
+    if (status == -1) return -1;
+
+    status = read_string(f, &metadata->album);
+    if (status == -1) return -1;
+
+    count = fread(&metadata->length, 1, 4, f);
+    if (count == 0) {
+        fprintf(stderr, "parse_rip: unexpected EOF\n");
+        return -1;
+    } else if (count != 4) {
+        perror("parse_rip");
+        return -1;
+    }
+
+#ifdef __LITTLE_ENDIAN
+    metadata->length = __bswap_32(metadata->length); 
+#endif
+
+    return 0;
+}
+
+static void free_metadata(struct track_metadata *metadata) {
+    free(metadata->name);
+    free(metadata->artist);
+    free(metadata->album);
+}
 
 static int bind_listener(const char *service) {
     struct addrinfo *result, *rp;
@@ -86,15 +178,32 @@ static int set_nonblock(int sfd) {
     return 0;
 }
 
+const char* const USAGE = "usage: %s <port> <file>\n";
+
 int main(int argc, char *argv[]) {
     int status, sfd, efd;
     struct epoll_event event;
     struct epoll_event *events;
+    struct track_metadata metadata;
+    FILE *rip_file;
 
-    if (argc != 2) {
+    if (argc != 3) {
         fprintf(stderr, USAGE, argv[0]);
         exit(EXIT_FAILURE);
     }
+
+    rip_file = fopen(argv[2], "rb");
+    if (rip_file == NULL) {
+        perror("fopen");
+        exit(EXIT_FAILURE);
+    }
+
+    status = parse_rip(rip_file, &metadata);
+    if (status == -1) exit(EXIT_FAILURE);
+
+    print_metadata(&metadata);
+    printf("\n");
+    free_metadata(&metadata);
 
     sfd = bind_listener(argv[1]);
     if (sfd == -1) exit(EXIT_FAILURE);
