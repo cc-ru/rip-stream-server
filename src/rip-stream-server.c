@@ -4,14 +4,15 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <sys/types.h>
-#include <sys/epoll.h>
-#include <sys/socket.h>
+#include <signal.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <byteswap.h>
+#include <sys/types.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
 
 #define MAXEVENTS 64
 
@@ -262,6 +263,13 @@ int client_read(struct epoll_event *event) {
     return 0;
 }
 
+static volatile int running = 1;
+
+void intHandler(int sig __attribute__((unused))) {
+    running = 0;
+    printf("\ninterrupted");
+}
+
 const char* const USAGE = "usage: %s <port> <file>\n";
 
 int main(int argc, char *argv[]) {
@@ -270,6 +278,8 @@ int main(int argc, char *argv[]) {
     struct epoll_event *events;
     struct track_metadata metadata;
     FILE *rip_file;
+
+    signal(SIGINT, intHandler);
 
     if (argc != 3) {
         fprintf(stderr, USAGE, argv[0]);
@@ -287,7 +297,6 @@ int main(int argc, char *argv[]) {
 
     print_metadata(&metadata);
     printf("\n");
-    free_metadata(&metadata);
 
     sfd = bind_listener(argv[1]);
     if (sfd == -1) exit(EXIT_FAILURE);
@@ -320,8 +329,10 @@ int main(int argc, char *argv[]) {
 
     printf("listening on %s port %d fd\n", argv[1], sfd);
 
-    for (;;) {
+    while (running) {
         int n = epoll_wait(efd, events, MAXEVENTS, -1);
+
+        if (n == -1) break;
         DEBUG_PRINT("processing %d events\n", n);
 
         for (int i = 0; i < n; i++) {
@@ -343,6 +354,7 @@ int main(int argc, char *argv[]) {
     }
 
     free(events);
+    free_metadata(&metadata);
     close(sfd);
 
     return EXIT_SUCCESS;
