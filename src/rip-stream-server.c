@@ -64,7 +64,10 @@ static int read_string(FILE *f, char **out) {
         fprintf(stderr, "parse_rip: unexpected EOF\n");
         return -1;
     } else if (count != len) {
-        perror("parse_rip");
+        if (errno != 0)
+            perror("parse_rip");
+        else
+            fprintf(stderr, "parse_rip: unexpected EOF\n");
         return -1;
     }
 
@@ -81,7 +84,10 @@ static int parse_rip(FILE *f, struct track_metadata *metadata) {
         fprintf(stderr, "parse_rip: unexpected EOF\n");
         return -1;
     } else if (count != 3) {
-        perror("parse_rip");
+        if (errno != 0)
+            perror("parse_rip");
+        else
+            fprintf(stderr, "parse_rip: unexpected EOF\n");
         return -1;
     }
 
@@ -104,7 +110,10 @@ static int parse_rip(FILE *f, struct track_metadata *metadata) {
         fprintf(stderr, "parse_rip: unexpected EOF\n");
         return -1;
     } else if (count != 4) {
-        perror("parse_rip");
+        if (errno != 0)
+            perror("parse_rip");
+        else
+            fprintf(stderr, "parse_rip: unexpected EOF\n");
         return -1;
     }
 
