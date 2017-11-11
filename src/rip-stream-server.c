@@ -216,7 +216,7 @@ int listener_accept(int sfd, int efd) {
             return -1;
 
         event.data.fd = infd;
-        event.events = EPOLLIN | EPOLLET;
+        event.events = EPOLLIN | EPOLLONESHOT;
 
         status = epoll_ctl(efd, EPOLL_CTL_ADD, infd, &event);
         if (status == -1) {
@@ -228,36 +228,35 @@ int listener_accept(int sfd, int efd) {
     return 0;
 }
 
-int client_read(struct epoll_event *event) {
-    int status;
-    int done = 0; 
+int client_read(struct epoll_event *event, int efd) {
+    ssize_t count;
+    int status, done = 0;
+    char buf;
 
-    for (;;) {
-        ssize_t count;
-        char buf[512];
-
-        count = read(event->data.fd, buf, sizeof buf);
-        if (count == -1) {
-            if (errno != EAGAIN) {
-                perror("read");
-                done = 1;
-            }
-            break;
-        } else if (count == 0) {
+    count = read(event->data.fd, &buf, sizeof(char));
+    if (count == -1) {
+        if (errno != EAGAIN) {
+            perror("read");
             done = 1;
-            break;
         }
-
-        status = write(1, buf, count);
-        if (status == -1) {
-            perror("write");
-            return -1;
-        }
+    } else if (count == 0) {
+        done = 1;
     }
 
+    if (buf == 0) done = 1;
+
     if (done) {
+        event->events = EPOLLOUT | EPOLLET;
+        status = epoll_ctl(efd, EPOLL_CTL_MOD, event->data.fd, event);
+        if (status == -1) {
+            perror("epoll_ctl");
+            return -1;
+        }
+
+        printf("initialized %d fd\n", event->data.fd);
+    } else {
+        close(event->data.fd);         
         printf("closed %d fd\n", event->data.fd);
-        close(event->data.fd);
     }
 
     return 0;
@@ -347,7 +346,7 @@ int main(int argc, char *argv[]) {
                 status = listener_accept(sfd, efd);
                 if (status == -1) exit(EXIT_FAILURE);
             } else {
-                status = client_read(&events[i]);
+                status = client_read(&events[i], efd);
                 if (status == -1) exit(EXIT_FAILURE);
             }
         }
