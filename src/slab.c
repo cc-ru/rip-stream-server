@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <string.h>
 #include "slab.h"
 
@@ -71,6 +72,24 @@ size_t slab_insert(slab_t *slab, const void *element) {
     entry->tag = ENTRY_OCCUPIED;
     memcpy(entry + sizeof(struct slab_entry), element, slab->element_size);
 
+    if (index == slab->end) {
+        if (slab->last != (size_t) -1) {
+            last_entry = slab->entries + (sizeof(struct slab_entry) + slab->element_size)
+                * slab->last;
+            last_entry->next = index;
+        }
+
+        slab->next++;
+        slab->end++;
+
+        if (slab->last == (size_t) -1)
+            slab->last = 0;
+        else
+            slab->last++;
+    } else {
+        slab->next = next_vacant; 
+    }
+
     for (i = index + 1; i <= slab->last && !slab_contains(slab, i); i++);
     entry->next = slab_contains(slab, i) ? i : (size_t) -1;
 
@@ -91,24 +110,6 @@ size_t slab_insert(slab_t *slab, const void *element) {
         prev_entry = slab->entries + (sizeof(struct slab_entry) + slab->element_size)
             * entry->prev;
         prev_entry->next = index;
-    }
-
-    if (index == slab->end) {
-        if (slab->last != (size_t) -1) {
-            last_entry = slab->entries + (sizeof(struct slab_entry) + slab->element_size)
-                * slab->last;
-            last_entry->next = index;
-        }
-
-        slab->next++;
-        slab->end++;
-
-        if (slab->last == (size_t) -1)
-            slab->last = 0;
-        else
-            slab->last++;
-    } else {
-        slab->next = next_vacant; 
     }
 
     if (index < slab->first)
@@ -148,10 +149,16 @@ void slab_remove(slab_t *slab, size_t key) {
     entry->next = nextnext;
 }
 
-int slab_iter_create(slab_t *slab, slab_iter_t *iter) {
+void slab_iter_create(slab_t *slab, slab_iter_t *iter) {
     struct slab_entry *entry;
 
-    if (slab->first == (size_t) -1) return -1;
+    if (slab->first == (size_t) -1) {
+        iter->prev_index = -1;
+        iter->index = -1;
+        iter->next_index = -1;
+        iter->data = NULL;
+        return;
+    }
 
     entry = slab->entries + (sizeof(struct slab_entry) + slab->element_size)
         * slab->first;
@@ -160,8 +167,6 @@ int slab_iter_create(slab_t *slab, slab_iter_t *iter) {
     iter->next_index = entry->next;
     iter->prev_index = entry->prev;
     iter->data = entry + sizeof(struct slab_entry);
-
-    return 0;
 }
 
 int slab_iter_done(slab_iter_t *iter) {

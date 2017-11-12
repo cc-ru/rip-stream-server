@@ -42,7 +42,7 @@ void *slab_get(slab_t *slab, size_t key);
 size_t slab_insert(slab_t *slab, const void *element);
 void slab_remove(slab_t *slab, size_t key);
 
-int slab_iter_create(slab_t *slab, slab_iter_t *iter);
+void slab_iter_create(slab_t *slab, slab_iter_t *iter);
 int slab_iter_done(slab_iter_t *iter);
 void slab_iter_next(slab_t *slab, slab_iter_t *iter);
 
