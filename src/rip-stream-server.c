@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <byteswap.h>
+#include <dirent.h> 
 #include <sys/types.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -19,6 +20,8 @@
 
 #define MAXEVENTS 64
 #define MAXCLIENTS 64
+#define SAMPLESIZE 1
+#define SAMPLERATE 1
 
 #ifndef NI_MAXHOST
 #define NI_MAXHOST 1025
@@ -62,7 +65,8 @@ static int read_string(FILE *f, char **out) {
     len = __bswap_16(len); 
 #endif
 
-    *out = (char *) malloc(len);
+    *out = (char *) malloc(len + 1);
+    out[len] = 0;
 
     count = fread(*out, 1, len, f);
     if (count == 0) {
@@ -133,6 +137,58 @@ static void free_metadata(struct track_metadata *metadata) {
     free(metadata->name);
     free(metadata->artist);
     free(metadata->album);
+}
+
+static size_t encode_metadata(const struct track_metadata *metadata,
+                              char **out)
+{
+    size_t name_lens, artist_lens, album_lens;
+
+    size_t name_len = strlen(metadata->name),
+           artist_len = strlen(metadata->artist),
+           album_len = strlen(metadata->album);
+
+    size_t len = 15 + name_len + artist_len + album_len;
+
+    name_lens = __bswap_16(name_len);
+    artist_lens = __bswap_16(artist_len);
+    album_lens = __bswap_16(album_len);
+
+    *out = (char *) malloc(len);
+    if (out == NULL) return -1;
+
+    *out[0] = 1;
+    
+    memcpy(*out + 1, &metadata->length, 4);
+    *(uint32_t *) (*out + 1) = __bswap_32(*(uint32_t *) (*out + 1));
+
+    memcpy(*out + 5, &name_lens, 2);
+    memcpy(*out + 7, metadata->name, name_len);
+
+    memcpy(*out + 7 + name_len, &artist_lens, 2);
+    memcpy(*out + 9 + name_len, metadata->artist, artist_len);
+
+    memcpy(*out + 9 + name_len + artist_len, &album_lens, 2);
+    memcpy(*out + 11 + name_len + artist_len, metadata->album, album_len);
+
+    return len;
+}
+
+static size_t read_chunk(FILE *f, char *out) {
+    size_t count = fread(out + 5, 1, SAMPLESIZE * SAMPLERATE, f);
+    if (count == 0 && errno != 0) {
+        if (feof(f))
+            return 0;
+        else
+            perror("read_chunk");
+        return -1;
+    }
+
+    out[0] = 2;
+    memcpy(out + 1, &count, 4);
+    *(uint32_t *) (out + 1) = __bswap_32(*(uint32_t *) (out + 1));
+
+    return count + 5;
 }
 
 static int bind_listener(const char *service) {
@@ -223,6 +279,7 @@ static int create_timer(void) {
 struct client {
     int fd;
     int initialized;
+    int first_time;
     size_t wrote;
     size_t index;
 };
@@ -258,6 +315,7 @@ static int listener_accept(int sfd, int efd, slab_t *clients) {
         client.fd = infd;
         client.initialized = 0;
         client.wrote = 0;
+        client.first_time = 1;
 
         index = slab_insert(clients, &client);
         if (index == -1) {
@@ -295,12 +353,12 @@ static int client_read(struct epoll_event *event, int efd) {
         done = 1;
     }
 
-    if (buf != 0) done = 1;
+    if (buf != 'a') done = 1;
 
     if (done) {
         close(client->fd);
     } else {
-        event->events = 0;
+        event->events = EPOLLOUT | EPOLLHUP;
         status = epoll_ctl(efd, EPOLL_CTL_MOD, client->fd, event);
         if (status == -1) {
             perror("epoll_ctl");
@@ -337,6 +395,10 @@ static int client_write(struct epoll_event *event, const char *buf, size_t len) 
         
         client->wrote += count;
     }
+
+    if (client->first_time && client->wrote == len) {
+        client->first_time = 0;
+    }
     
     if (done) {
         close(client->fd);
@@ -345,7 +407,9 @@ static int client_write(struct epoll_event *event, const char *buf, size_t len) 
     return 0;
 }
 
-static int timer_read(int timerfd, int efd, slab_t *clients) {
+static int timer_read(int timerfd, int efd, slab_t *clients,
+                      char *chunk, size_t *chunk_len, FILE *rip_file)
+{
     struct epoll_event event;
     uint64_t time;
     ssize_t count;
@@ -354,9 +418,10 @@ static int timer_read(int timerfd, int efd, slab_t *clients) {
     slab_iter_t iter;
 
     count = read(timerfd, &time, 8);
-    if (count != 8) {
-        return -1;
-    }
+    if (count != 8) return -1; 
+
+    *chunk_len = read_chunk(rip_file, chunk);
+    if (*chunk_len == (size_t) -1) return -1;
 
     event.events = EPOLLOUT | EPOLLET;
 
@@ -397,9 +462,12 @@ int main(int argc, char *argv[]) {
     slab_t clients;
     FILE *rip_file;
 
-    char buf[] = "Hello, world!\n";
-    size_t len = 14;
+    char *metadata_out;
+    size_t metadata_out_len;
 
+    char chunk[SAMPLESIZE * SAMPLERATE + 5] = {0};
+    size_t chunk_len = 0;
+    
     if (argc != 3) {
         fprintf(stderr, USAGE, argv[0]);
         exit(EXIT_FAILURE);
@@ -421,6 +489,9 @@ int main(int argc, char *argv[]) {
 
     print_metadata(&metadata);
     printf("\n");
+
+    metadata_out_len = encode_metadata(&metadata, &metadata_out);
+    if (metadata_out_len == (size_t) -1) exit(EXIT_FAILURE);
 
     sfd = bind_listener(argv[1]);
     if (sfd == -1) exit(EXIT_FAILURE);
@@ -489,13 +560,16 @@ int main(int argc, char *argv[]) {
                 status = listener_accept(sfd, efd, &clients);
                 if (status == -1) exit(EXIT_FAILURE);
             } else if (events[i].data.fd == timerfd) {
-                status = timer_read(timerfd, efd, &clients);
+                status = timer_read(timerfd, efd, &clients, chunk, &chunk_len, rip_file);
                 if (status == -1) exit(EXIT_FAILURE);
             } else if (events[i].events & EPOLLIN) {
                 status = client_read(&events[i], efd);
                 if (status == -1) exit(EXIT_FAILURE);
             } else if (events[i].events & EPOLLOUT) {
-                status = client_write(&events[i], buf, len);
+                if (((struct client *) events[i].data.ptr)->first_time)
+                    status = client_write(&events[i], metadata_out, metadata_out_len);
+                else
+                    status = client_write(&events[i], chunk, chunk_len);
                 if (status == -1) exit(EXIT_FAILURE);
             }
         }
@@ -504,6 +578,7 @@ int main(int argc, char *argv[]) {
     free(events);
     free_metadata(&metadata);
     close(sfd);
+    fclose(rip_file);
 
     return EXIT_SUCCESS;
 }
