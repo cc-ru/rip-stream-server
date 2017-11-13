@@ -1,4 +1,5 @@
 #define _XOPEN_SOURCE 700
+#define _GNU_SOURCE
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -156,21 +157,36 @@ static int listener_accept(int sfd, int efd, slab_t *clients) {
 }
 
 static int timer_read(int timerfd, int efd, slab_t *clients,
-                      char *chunk, size_t *chunk_len, FILE *rip_file,
-                      uint32_t *rip_time)
+                      char *chunk, size_t *chunk_len, FILE **rip_file,
+                      char **playlist, int *current_song, int playlist_size,
+                      struct rip_metadata *metadata, char **metadata_out,
+                      size_t *metadata_out_len, uint32_t *rip_time)
 {
     struct epoll_event event;
     ssize_t count;
     struct client *client;
     ssize_t time;
-    int status;
+    int status, next = 0;
     slab_iter_t iter;
 
     count = read(timerfd, &time, 8);
     if (count != 8) return -1; 
 
-    *chunk_len = rip_read_chunk(rip_file, chunk, rip_time);
-    if (*chunk_len == (size_t) -1) return -1;
+    *chunk_len = rip_read_chunk(*rip_file, chunk, rip_time);
+    if (*chunk_len == (size_t) -1)
+        return -1;
+    else if (*chunk_len == 0) {
+        *current_song += 1;
+
+        if (*current_song >= playlist_size) *current_song = 0;
+        status = load_song(playlist[*current_song], metadata,
+                  metadata_out, metadata_out_len, rip_time, rip_file);
+        if (status == -1) return -1;
+
+        *chunk_len = rip_read_chunk(*rip_file, chunk, rip_time);
+        if (*chunk_len == (size_t) -1) return -1;
+        next = 1;
+    }
 
     event.events = EPOLLOUT | EPOLLET;
 
@@ -180,6 +196,7 @@ static int timer_read(int timerfd, int efd, slab_t *clients,
         client = (struct client *) iter.data;
         if (client->initialized) {
             client->wrote = 0;
+            client->first_time = next;
             event.data.ptr = client;
 
             status = epoll_ctl(efd, EPOLL_CTL_MOD, client->fd, &event);
@@ -198,19 +215,19 @@ static int client_read(struct client *client, slab_t *clients, int efd) {
     ssize_t count;
     struct epoll_event event;
     char buf;
-    int status, done = 0;
+    int status, closing = 0;
 
     count = read(client->fd, &buf, sizeof(char));
     if (count == -1) {
         if (errno != EAGAIN) {
             perror("read");
-            done = 1;
+            closing = 1;
         }
     }
 
-    if (count == 0 || buf != 'a') done = 1;
+    if (count == 0 || buf != 'a') closing = 1;
 
-    if (done) {
+    if (closing) {
         client_close(client, clients, efd);
     } else {
         event.data.ptr = client;
@@ -233,23 +250,23 @@ static int client_read(struct client *client, slab_t *clients, int efd) {
 static int client_write(struct client *client, const char *buf, size_t len,
                         slab_t *clients, int efd)
 {
-    int done;
+    int closing;
     ssize_t count;
 
-    done = 0;
+    closing = 0;
 
-    if (len == 0) done = 1;
+    if (len == 0) closing = 1;
 
     while (client->wrote < len) {
         count = write(client->fd, buf + client->wrote, len - client->wrote);
         if (count == -1) {
             if (errno != EAGAIN) {
                 perror("write");
-                done = 1;
+                closing = 1;
             }
             break;
         } else if (count == 0) {
-            done = 1;
+            closing = 1;
             break;
         }
         
@@ -260,7 +277,7 @@ static int client_write(struct client *client, const char *buf, size_t len,
         client->first_time = 0;
     }
     
-    if (done) {
+    if (closing) {
         client_close(client, clients, efd);
     }
 
@@ -277,10 +294,93 @@ static int client_close(struct client *client, slab_t *clients, int efd) {
     status = epoll_ctl(efd, EPOLL_CTL_DEL, client->fd, NULL);
     if (status == -1) {
         perror("epoll_ctl");
-        exit(EXIT_FAILURE);
+        return -1;
     }
 
     slab_remove(clients, client->index);
+    return 0;
+}
+
+static int load_playlist(char *dir_path, char ***out) {
+    struct dirent *dir;
+    size_t dir_path_len = strlen(dir_path);
+    char *dot;
+    DIR *d;
+    int n = 0, i = 0;
+
+    d = opendir(dir_path);
+    if (d == NULL) {
+        perror("opendir");
+        return -1;
+    }
+
+    while ((dir = readdir(d)) != NULL) {
+        if (dir->d_type != DT_REG) continue;
+        dot = strrchr(dir->d_name, '.');
+        if (!dot || strcmp(dot, ".rip")) continue;
+        n++; 
+    }
+
+    closedir(d);
+
+    if (n == 0) {
+        fprintf(stderr, "empty playlist");
+        return -1;
+    }
+
+    d = opendir(dir_path);
+    if (d == NULL) {
+        perror("opendir");
+        return -1;
+    }
+    
+    *out = (char **) malloc(n * sizeof(char *));
+    if (*out == NULL) return -1;
+
+    while ((dir = readdir(d)) != NULL) {
+        if (dir->d_type != DT_REG) continue;
+        dot = strrchr(dir->d_name, '.');
+        if (!dot || strcmp(dot, ".rip")) continue;
+
+        *out[i] = (char *) malloc(strlen(dir->d_name) + dir_path_len + 2);
+        if (*out[i] == NULL) return -1;
+
+        memcpy(*out[i], dir_path, dir_path_len);
+        (*out)[i][dir_path_len] = '/';
+        memcpy(*out[i] + dir_path_len + 1, dir->d_name, strlen(dir->d_name) + 1);
+
+        i++;
+    }
+
+    closedir(d);
+
+    return n;
+}
+
+static int load_song(char *song_path, struct rip_metadata *metadata,
+                     char **metadata_out, size_t *metadata_out_len,
+                     uint32_t *time, FILE **rip_file)
+{
+    int status;
+
+    *rip_file = fopen(song_path, "rb");
+    if (rip_file == NULL) {
+        perror("fopen");
+        return -1;
+    }
+
+    status = rip_parse_metadata(*rip_file, metadata);
+    if (status == -1) return -1;
+    
+    printf("current song: ");
+    rip_print_metadata(metadata);
+    printf("\n");
+
+    *metadata_out_len = rip_encode_metadata(metadata, metadata_out);
+    if (*metadata_out_len == (size_t) -1) return -1;
+
+    *time = 0;
+
     return 0;
 }
 
@@ -291,7 +391,7 @@ void intHandler(int sig __attribute__((unused))) {
     printf("\ninterrupted");
 }
 
-const char* const USAGE = "usage: %s <port> <file>\n";
+const char* const USAGE = "usage: %s <port> <playlist>\n";
 
 int main(int argc, char *argv[]) {
     int status, sfd, efd, timerfd;
@@ -307,6 +407,10 @@ int main(int argc, char *argv[]) {
     char chunk[SAMPLESIZE * SAMPLERATE + 9] = {0};
     size_t chunk_len = 0;
     uint32_t time = 0;
+
+    char **playlist = NULL;
+    int current_song = 0;
+    int playlist_size;
     
     if (argc != 3) {
         fprintf(stderr, USAGE, argv[0]);
@@ -318,20 +422,12 @@ int main(int argc, char *argv[]) {
     status = slab_new(&clients, MAXCLIENTS, sizeof(struct client));
     if (status == -1) exit(EXIT_FAILURE);
 
-    rip_file = fopen(argv[2], "rb");
-    if (rip_file == NULL) {
-        perror("fopen");
-        exit(EXIT_FAILURE);
-    }
+    playlist_size = load_playlist(argv[2], &playlist);
+    if (playlist_size == -1) exit(EXIT_FAILURE);
 
-    status = rip_parse_metadata(rip_file, &metadata);
+    status = load_song(playlist[current_song], &metadata, &metadata_out,
+                       &metadata_out_len, &time, &rip_file);
     if (status == -1) exit(EXIT_FAILURE);
-
-    rip_print_metadata(&metadata);
-    printf("\n");
-
-    metadata_out_len = rip_encode_metadata(&metadata, &metadata_out);
-    if (metadata_out_len == (size_t) -1) exit(EXIT_FAILURE);
 
     sfd = bind_listener(argv[1]);
     if (sfd == -1) exit(EXIT_FAILURE);
@@ -390,7 +486,9 @@ int main(int argc, char *argv[]) {
 
             } else if (events[i].data.fd == timerfd) {
                 status = timer_read(timerfd, efd, &clients, chunk, &chunk_len,
-                                    rip_file, &time);
+                                    &rip_file, playlist, &current_song,
+                                    playlist_size, &metadata, &metadata_out,
+                                    &metadata_out_len, &time);
 
                 if (status == -1) exit(EXIT_FAILURE);
 

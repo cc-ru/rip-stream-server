@@ -114,7 +114,6 @@ size_t rip_encode_metadata(const struct rip_metadata *metadata,
     *out[0] = 1;
     
     memcpy(*out + 1, &metadata->length, 4);
-    printf("%u\n", *(uint32_t *) (*out + 1));
     if (IS_LITTLE_ENDIAN)
         *(uint32_t *) (*out + 1) = __bswap_32(*(uint32_t *) (*out + 1));
 
