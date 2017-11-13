@@ -21,7 +21,7 @@
 #define MAXEVENTS 64
 #define MAXCLIENTS 64
 #define SAMPLESIZE 1
-#define SAMPLERATE 1
+#define SAMPLERATE 2
 
 #ifndef NI_MAXHOST
 #define NI_MAXHOST 1025
@@ -127,7 +127,7 @@ static int parse_rip(FILE *f, struct track_metadata *metadata) {
     }
 
 #ifdef __LITTLE_ENDIAN
-    metadata->length = __bswap_32(metadata->length); 
+    metadata->length = __bswap_32(metadata->length) / SAMPLESIZE / SAMPLERATE * 100;
 #endif
 
     return 0;
@@ -148,11 +148,17 @@ static size_t encode_metadata(const struct track_metadata *metadata,
            artist_len = strlen(metadata->artist),
            album_len = strlen(metadata->album);
 
-    size_t len = 15 + name_len + artist_len + album_len;
+    size_t len = 11 + name_len + artist_len + album_len;
 
+#ifdef __LITTLE_ENDIAN
     name_lens = __bswap_16(name_len);
     artist_lens = __bswap_16(artist_len);
     album_lens = __bswap_16(album_len);
+#else
+    name_lens = name_len;
+    artist_lens = artist_len;
+    album_lens = album_len;
+#endif
 
     *out = (char *) malloc(len);
     if (out == NULL) return -1;
@@ -160,7 +166,9 @@ static size_t encode_metadata(const struct track_metadata *metadata,
     *out[0] = 1;
     
     memcpy(*out + 1, &metadata->length, 4);
+#ifdef __LITTLE_ENDIAN
     *(uint32_t *) (*out + 1) = __bswap_32(*(uint32_t *) (*out + 1));
+#endif
 
     memcpy(*out + 5, &name_lens, 2);
     memcpy(*out + 7, metadata->name, name_len);
@@ -174,8 +182,9 @@ static size_t encode_metadata(const struct track_metadata *metadata,
     return len;
 }
 
-static size_t read_chunk(FILE *f, char *out) {
-    size_t count = fread(out + 5, 1, SAMPLESIZE * SAMPLERATE, f);
+static size_t read_chunk(FILE *f, char *out, uint32_t *time) {
+    size_t count = fread(out + 9, 1, SAMPLESIZE * SAMPLERATE, f);
+
     if (count == 0 && errno != 0) {
         if (feof(f))
             return 0;
@@ -185,10 +194,20 @@ static size_t read_chunk(FILE *f, char *out) {
     }
 
     out[0] = 2;
-    memcpy(out + 1, &count, 4);
-    *(uint32_t *) (out + 1) = __bswap_32(*(uint32_t *) (out + 1));
 
-    return count + 5;
+    memcpy(out + 1, &count, 4);
+#ifdef __LITTLE_ENDIAN
+    *(uint32_t *) (out + 1) = __bswap_32(*(uint32_t *) (out + 1));
+#endif
+
+    memcpy(out + 5, time, 4);
+#ifdef __LITTLE_ENDIAN
+    *(uint32_t *) (out + 5) = __bswap_32(*(uint32_t *) (out + 5));
+#endif
+
+    *time += count / SAMPLESIZE / SAMPLERATE * 100;
+
+    return count + 9;
 }
 
 static int bind_listener(const char *service) {
@@ -336,7 +355,24 @@ static int listener_accept(int sfd, int efd, slab_t *clients) {
     return 0;
 }
 
-static int client_read(struct epoll_event *event, int efd) {
+static int client_close(struct client *client, slab_t *clients, int efd) {
+    int status;
+
+    printf("closed %d fd\n", client->fd);
+
+    shutdown(client->fd, SHUT_RDWR);
+
+    status = epoll_ctl(efd, EPOLL_CTL_DEL, client->fd, NULL);
+    if (status == -1) {
+        perror("epoll_ctl");
+        exit(EXIT_FAILURE);
+    }
+
+    slab_remove(clients, client->index);
+    return 0;
+}
+
+static int client_read(struct epoll_event *event, slab_t *clients, int efd) {
     ssize_t count;
     int status, done = 0;
     char buf;
@@ -349,16 +385,14 @@ static int client_read(struct epoll_event *event, int efd) {
             perror("read");
             done = 1;
         }
-    } else if (count == 0) {
-        done = 1;
     }
 
-    if (buf != 'a') done = 1;
+    if (count == 0 || buf != 'a') done = 1;
 
     if (done) {
-        close(client->fd);
+        client_close(client, clients, efd);
     } else {
-        event->events = EPOLLOUT | EPOLLHUP;
+        event->events = EPOLLOUT | EPOLLET;
         status = epoll_ctl(efd, EPOLL_CTL_MOD, client->fd, event);
         if (status == -1) {
             perror("epoll_ctl");
@@ -373,12 +407,15 @@ static int client_read(struct epoll_event *event, int efd) {
     return 0;
 }
 
-static int client_write(struct epoll_event *event, const char *buf, size_t len) {
+static int client_write(struct epoll_event *event, const char *buf, size_t len,
+                        slab_t *clients, int efd) {
     int done;
     ssize_t count;
     struct client *client = (struct client *) event->data.ptr;
 
     done = 0;
+
+    if (len == 0) done = 1;
 
     while (client->wrote < len) {
         count = write(client->fd, buf + client->wrote, len - client->wrote);
@@ -396,31 +433,32 @@ static int client_write(struct epoll_event *event, const char *buf, size_t len) 
         client->wrote += count;
     }
 
-    if (client->first_time && client->wrote == len) {
+    if (client->wrote == len) {
         client->first_time = 0;
     }
     
     if (done) {
-        close(client->fd);
+        client_close(client, clients, efd);
     }
 
     return 0;
 }
 
 static int timer_read(int timerfd, int efd, slab_t *clients,
-                      char *chunk, size_t *chunk_len, FILE *rip_file)
+                      char *chunk, size_t *chunk_len, FILE *rip_file,
+                      uint32_t *rip_time)
 {
     struct epoll_event event;
-    uint64_t time;
     ssize_t count;
     struct client *client;
+    ssize_t time;
     int status;
     slab_iter_t iter;
 
     count = read(timerfd, &time, 8);
     if (count != 8) return -1; 
 
-    *chunk_len = read_chunk(rip_file, chunk);
+    *chunk_len = read_chunk(rip_file, chunk, rip_time);
     if (*chunk_len == (size_t) -1) return -1;
 
     event.events = EPOLLOUT | EPOLLET;
@@ -465,8 +503,9 @@ int main(int argc, char *argv[]) {
     char *metadata_out;
     size_t metadata_out_len;
 
-    char chunk[SAMPLESIZE * SAMPLERATE + 5] = {0};
+    char chunk[SAMPLESIZE * SAMPLERATE + 9] = {0};
     size_t chunk_len = 0;
+    uint32_t time = 0;
     
     if (argc != 3) {
         fprintf(stderr, USAGE, argv[0]);
@@ -542,34 +581,29 @@ int main(int argc, char *argv[]) {
         if (n == -1) break;
 
         for (int i = 0; i < n; i++) {
-            if (events[i].events & EPOLLERR
-                || events[i].events & EPOLLHUP)
-            {
-                int fd = ((struct client *) events[i].data.ptr)->fd;
-
-                printf("closed %d fd\n", fd);
-
-                status = epoll_ctl(efd, EPOLL_CTL_DEL, fd, NULL);
-                if (status == -1) {
-                    perror("epoll_ctl");
-                    exit(EXIT_FAILURE);
-                }
-
-                slab_remove(&clients, ((struct client *) events[i].data.ptr)->index);
-            } else if (events[i].data.fd == sfd) {
+            if (events[i].data.fd == sfd) {
                 status = listener_accept(sfd, efd, &clients);
                 if (status == -1) exit(EXIT_FAILURE);
+
             } else if (events[i].data.fd == timerfd) {
-                status = timer_read(timerfd, efd, &clients, chunk, &chunk_len, rip_file);
+                status = timer_read(timerfd, efd, &clients, chunk, &chunk_len, rip_file, &time);
                 if (status == -1) exit(EXIT_FAILURE);
+
             } else if (events[i].events & EPOLLIN) {
-                status = client_read(&events[i], efd);
+                status = client_read(&events[i], &clients, efd);
                 if (status == -1) exit(EXIT_FAILURE);
+
             } else if (events[i].events & EPOLLOUT) {
                 if (((struct client *) events[i].data.ptr)->first_time)
-                    status = client_write(&events[i], metadata_out, metadata_out_len);
+                    status = client_write(&events[i], metadata_out, metadata_out_len, &clients, efd);
                 else
-                    status = client_write(&events[i], chunk, chunk_len);
+                    status = client_write(&events[i], chunk, chunk_len, &clients, efd);
+                if (status == -1) exit(EXIT_FAILURE);
+
+            } else if (events[i].events & EPOLLHUP
+                       || events[i].events & EPOLLERR)
+            {
+                status = client_close((struct client *) events[i].data.ptr, &clients, efd);
                 if (status == -1) exit(EXIT_FAILURE);
             }
         }
