@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #define SAMPLESIZE 1
-#define SAMPLERATE 2
+#define SAMPLERATE 48000
 
 struct rip_metadata {
     char *name;

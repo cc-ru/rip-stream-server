@@ -24,8 +24,7 @@ int rip_parse_string(FILE *f, char **out) {
     if (IS_LITTLE_ENDIAN)
         len = __bswap_16(len); 
 
-    *out = (char *) malloc(len + 1);
-    out[len] = 0;
+    *out = (char *) calloc(len + 1, 1);
 
     count = fread(*out, 1, len, f);
     if (count != len) {
@@ -143,7 +142,7 @@ void rip_free_metadata(struct rip_metadata *metadata) {
 size_t rip_read_chunk(FILE *f, char *out, uint32_t *time) {
     size_t count = fread(out + 9, 1, SAMPLESIZE * SAMPLERATE, f);
 
-    if (count == 0 && errno != 0) {
+    if (count == 0) {
         if (feof(f))
             return 0;
         else

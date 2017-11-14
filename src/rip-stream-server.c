@@ -135,7 +135,7 @@ static int listener_accept(int sfd, int efd, slab_t *clients) {
         client.fd = infd;
         client.initialized = 0;
         client.wrote = 0;
-        client.first_time = 1;
+        client.needs_metadata = 1;
 
         index = slab_insert(clients, &client);
         if (index == -1) {
@@ -182,9 +182,6 @@ static int timer_read(int timerfd, int efd, slab_t *clients,
         status = load_song(playlist[*current_song], metadata,
                   metadata_out, metadata_out_len, rip_time, rip_file);
         if (status == -1) return -1;
-
-        *chunk_len = rip_read_chunk(*rip_file, chunk, rip_time);
-        if (*chunk_len == (size_t) -1) return -1;
         next = 1;
     }
 
@@ -196,7 +193,7 @@ static int timer_read(int timerfd, int efd, slab_t *clients,
         client = (struct client *) iter.data;
         if (client->initialized) {
             client->wrote = 0;
-            client->first_time = next;
+            client->needs_metadata = next;
             event.data.ptr = client;
 
             status = epoll_ctl(efd, EPOLL_CTL_MOD, client->fd, &event);
@@ -217,15 +214,14 @@ static int client_read(struct client *client, slab_t *clients, int efd) {
     char buf;
     int status, closing = 0;
 
-    count = read(client->fd, &buf, sizeof(char));
+    count = recv(client->fd, &buf, sizeof(char), 0);
     if (count == -1) {
         if (errno != EAGAIN) {
-            perror("read");
             closing = 1;
         }
     }
 
-    if (count == 0 || buf != 'a') closing = 1;
+    if (count == 0 || buf != 0) closing = 1;
 
     if (closing) {
         client_close(client, clients, efd);
@@ -258,10 +254,9 @@ static int client_write(struct client *client, const char *buf, size_t len,
     if (len == 0) closing = 1;
 
     while (client->wrote < len) {
-        count = write(client->fd, buf + client->wrote, len - client->wrote);
+        count = send(client->fd, buf + client->wrote, len - client->wrote, MSG_NOSIGNAL);
         if (count == -1) {
             if (errno != EAGAIN) {
-                perror("write");
                 closing = 1;
             }
             break;
@@ -274,7 +269,7 @@ static int client_write(struct client *client, const char *buf, size_t len,
     }
 
     if (client->wrote == len) {
-        client->first_time = 0;
+        client->needs_metadata = 0;
     }
     
     if (closing) {
@@ -333,7 +328,7 @@ static int load_playlist(char *dir_path, char ***out) {
         perror("opendir");
         return -1;
     }
-    
+
     *out = (char **) malloc(n * sizeof(char *));
     if (*out == NULL) return -1;
 
@@ -342,12 +337,13 @@ static int load_playlist(char *dir_path, char ***out) {
         dot = strrchr(dir->d_name, '.');
         if (!dot || strcmp(dot, ".rip")) continue;
 
-        *out[i] = (char *) malloc(strlen(dir->d_name) + dir_path_len + 2);
-        if (*out[i] == NULL) return -1;
-
-        memcpy(*out[i], dir_path, dir_path_len);
+        (*out)[i] = (char *) malloc(strlen(dir->d_name) + dir_path_len + 2);
+        if ((*out)[i] == NULL) return -1;
+        
+        memcpy((*out)[i], dir_path, dir_path_len);
         (*out)[i][dir_path_len] = '/';
-        memcpy(*out[i] + dir_path_len + 1, dir->d_name, strlen(dir->d_name) + 1);
+        memcpy((*out)[i] + dir_path_len + 1, dir->d_name,
+               strlen(dir->d_name) + 1);
 
         i++;
     }
@@ -362,6 +358,9 @@ static int load_song(char *song_path, struct rip_metadata *metadata,
                      uint32_t *time, FILE **rip_file)
 {
     int status;
+
+    if (*rip_file != NULL)
+        fclose(*rip_file);
 
     *rip_file = fopen(song_path, "rb");
     if (rip_file == NULL) {
@@ -424,6 +423,8 @@ int main(int argc, char *argv[]) {
 
     playlist_size = load_playlist(argv[2], &playlist);
     if (playlist_size == -1) exit(EXIT_FAILURE);
+
+    printf("playlist loaded (%d songs)\n", playlist_size);
 
     status = load_song(playlist[current_song], &metadata, &metadata_out,
                        &metadata_out_len, &time, &rip_file);
@@ -497,14 +498,13 @@ int main(int argc, char *argv[]) {
                 if (status == -1) exit(EXIT_FAILURE);
 
             } else if (events[i].events & EPOLLOUT) {
-                if (client->first_time)
+                if (client->needs_metadata)
                     status = client_write(client, metadata_out,
                                           metadata_out_len,
                                           &clients, efd);
                 else
                     status = client_write(client, chunk, chunk_len,
                                           &clients, efd);
-
                 if (status == -1) exit(EXIT_FAILURE);
 
             } else if (events[i].events & EPOLLHUP

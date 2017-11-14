@@ -24,8 +24,8 @@ static int create_timer(void);
 
 struct client {
     int fd;
-    int initialized;
-    int first_time;
+    unsigned int initialized: 1;
+    unsigned int needs_metadata: 1;
     size_t wrote;
     size_t index;
 };
