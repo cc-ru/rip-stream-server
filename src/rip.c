@@ -81,7 +81,7 @@ int rip_parse_metadata(FILE *f, struct rip_metadata *metadata) {
     if (IS_LITTLE_ENDIAN)
         metadata->length = __bswap_32(metadata->length);
 
-    metadata->length = metadata->length / SAMPLESIZE / SAMPLERATE * 100;
+    metadata->length = metadata->length * 8 / SAMPLESIZE / SAMPLERATE * 100;
 
     return 0;
 }
@@ -140,7 +140,7 @@ void rip_free_metadata(struct rip_metadata *metadata) {
 }
 
 size_t rip_read_chunk(FILE *f, char *out, uint32_t *time) {
-    size_t count = fread(out + 9, 1, SAMPLESIZE * SAMPLERATE, f);
+    size_t count = fread(out + 9, 1, SAMPLESIZE * SAMPLERATE / 8, f);
 
     if (count == 0) {
         if (feof(f))
@@ -160,7 +160,7 @@ size_t rip_read_chunk(FILE *f, char *out, uint32_t *time) {
     if (IS_LITTLE_ENDIAN)
         *(uint32_t *) (out + 5) = __bswap_32(*(uint32_t *) (out + 5));
 
-    *time += count / SAMPLESIZE / SAMPLERATE * 100;
+    *time += count * 8 / SAMPLESIZE / SAMPLERATE * 100;
 
     return count + 9;
 }

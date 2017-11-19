@@ -221,7 +221,7 @@ static int client_read(struct client *client, slab_t *clients, int efd) {
         }
     }
 
-    if (count == 0 || buf != 0) closing = 1;
+    if (count == 0 || buf != 'a') closing = 1;
 
     if (closing) {
         client_close(client, clients, efd);
@@ -403,7 +403,7 @@ int main(int argc, char *argv[]) {
     char *metadata_out;
     size_t metadata_out_len;
 
-    char chunk[SAMPLESIZE * SAMPLERATE + 9] = {0};
+    char chunk[8 * SAMPLESIZE * SAMPLERATE + 9] = {0};
     size_t chunk_len = 0;
     uint32_t time = 0;
 
