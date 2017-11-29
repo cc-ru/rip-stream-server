@@ -14,8 +14,8 @@
 
 ### TrackData
     [0x02]
-    [[4 bytes: playback time]
-     [dfpwm data: packet length - 4 bytes]]
+    [playback time: 4 bytes]
+    [[length: 4 bytes] [dfpwm data: length]]
 
 ## `.rip` format specification
     [0x72 0x69 0x70]
